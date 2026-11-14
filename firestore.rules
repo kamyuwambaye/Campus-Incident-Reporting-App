@@ -1,0 +1,84 @@
+rules_version = '2';
+
+// Campus Incident Reporter - Firestore security rules
+//
+// Roles are stored on users/{uid}.role as 'student' or 'staff'.
+// A user can never grant themselves the staff role: the role is set to
+// 'student' at sign-up and may only be changed by an administrator in the
+// Firebase console (or an Admin SDK script).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function userRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isStaff() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && userRole() == 'staff';
+    }
+
+    function validCategory(c) {
+      return c in ['facilities', 'water', 'electricity', 'furniture', 'sanitation', 'safety'];
+    }
+
+    function validStatus(s) {
+      return s in ['submitted', 'in_progress', 'resolved'];
+    }
+
+    // ---- User profiles -------------------------------------------------
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isStaff();
+
+      // New accounts are always students.
+      allow create: if isOwner(uid)
+        && request.resource.data.role == 'student'
+        && request.resource.data.name is string
+        && request.resource.data.email is string;
+
+      // Users may edit their profile but never their own role.
+      allow update: if isOwner(uid)
+        && request.resource.data.role == resource.data.role;
+
+      allow delete: if false;
+    }
+
+    // ---- Incident reports ----------------------------------------------
+    match /incidents/{incidentId} {
+      // Every signed-in member of campus can browse reports.
+      allow read: if signedIn();
+
+      // Students (and staff) create reports in their own name, always 'submitted'.
+      allow create: if signedIn()
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.status == 'submitted'
+        && validCategory(request.resource.data.category)
+        && request.resource.data.title is string
+        && request.resource.data.title.size() >= 5
+        && request.resource.data.title.size() <= 80
+        && request.resource.data.description is string
+        && request.resource.data.description.size() >= 20
+        && request.resource.data.description.size() <= 1000
+        && request.resource.data.location is string;
+
+      // Only staff can progress a report, and only the status-related fields.
+      allow update: if isStaff()
+        && validStatus(request.resource.data.status)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'statusHistory', 'updatedAt']);
+
+      // A reporter may withdraw their own report while it is still 'submitted'.
+      allow delete: if isOwner(resource.data.reporterId)
+        && resource.data.status == 'submitted';
+    }
+  }
+}
